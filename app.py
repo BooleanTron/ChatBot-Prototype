@@ -1,0 +1,279 @@
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+import google.generativeai as genai
+import os
+from dotenv import load_dotenv
+import time
+import json
+import re
+
+# Load environment variables
+load_dotenv()
+
+app = Flask(__name__)
+CORS(app)  # Enable CORS for React frontend
+
+# Configure Gemini API
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+
+if not GEMINI_API_KEY:
+    print("⚠️  WARNING: GEMINI_API_KEY not found in environment variables!")
+    print("Please add your Gemini API key to the .env file")
+else:
+    genai.configure(api_key=GEMINI_API_KEY)
+    print("✅ Gemini API configured successfully")
+
+# Initialize Gemini model
+try:
+    model = genai.GenerativeModel('gemini-2.5-pro')
+    print("✅ Gemini Pro model loaded")
+except Exception as e:
+    print(f"❌ Error loading Gemini model: {str(e)}")
+    model = None
+
+# Load products from products.json
+try:
+    with open('products.json', 'r') as file:
+        products = json.load(file)
+    print("✅ Products loaded from products.json")
+except Exception as e:
+    print(f"❌ Error loading products.json: {str(e)}")
+    products = []
+
+# Store conversation history (in production, use a proper database)
+conversation_sessions = {}
+
+def sanitize_links(text, products):
+    """
+    Ensure product links in the response are formatted as HTML <a> tags.
+    Replace plain URLs or markdown links with proper HTML links.
+    """
+    for product in products:
+        product_name = product['Name']
+        product_link = product['Link']
+        # Replace plain URLs or markdown links with HTML <a> tags
+        text = re.sub(
+            r'\[(' + re.escape(product_name) + r')\]\(' + re.escape(product_link) + r'\)',
+            f'<a href="{product_link}" target="_blank">{product_name}</a>',
+            text
+        )
+        text = re.sub(
+            r'(?<!href=")(' + re.escape(product_link) + r')',
+            f'<a href="{product_link}" target="_blank">{product_name}</a>',
+            text
+        )
+    return text
+
+def get_gemini_response(message, user_id=None, session_id=None):
+    """
+    Get response from Gemini API
+    
+    Args:
+        message (str): User's message
+        user_id (str): User identifier
+        session_id (str): Session identifier
+    
+    Returns:
+        dict: Response with message and type
+    """
+    try:
+        if not model:
+            return {
+                'message': "Sorry, I'm having trouble connecting to my AI brain right now. Please try again later!",
+                'type': 'text'
+            }
+        
+        # Create session key
+        session_key = f"{user_id}_{session_id}"
+        
+        # Initialize conversation history if new session
+        if session_key not in conversation_sessions:
+            conversation_sessions[session_key] = []
+        
+        # Check if user wants detailed response
+        detailed_keywords = ['explain', 'detailed', 'tell me more', 'describe', 'how', 'why', 'what is', 'elaborate']
+        wants_detailed = any(keyword in message.lower() for keyword in detailed_keywords)
+        
+        # Add system context for clothing store assistant
+        system_prompt = f"""You are an expert fashion assistant for Pink Matter, a trendy clothing store specializing in streetwear and urban fashion. Your goal is to provide personalized, friendly, and professional advice as if you're helping customers in a physical store. Use the following product catalog to make specific recommendations:
+
+{json.dumps(products, indent=2)}
+
+RESPONSE LENGTH RULES:
+- Keep responses SHORT and conversational (50 words max) unless user specifically asks for detailed explanations with words like "explain", "detailed", "tell me more", "describe", "how", "why"
+- Be direct and to the point - no lengthy introductions
+- Focus on 1-2 product recommendations max for normal responses
+- Only give longer responses when explicitly asked for details
+
+GUIDELINES:
+- Be conversational, warm, and engaging, like a knowledgeable store associate
+- Answer questions about product availability, styling, outfit combinations, and occasion-based recommendations
+- If asked about items not in the catalog (e.g., shoes), briefly explain that Pink Matter specializes in oversized tees, vests, acid-washed tees, and baggy pants
+- For outfit pairing questions, suggest 1-2 specific products by name and color
+- For every product mentioned, include its name, color, price, and clickable link: <a href="[Link]" target="_blank">[Product Name]</a>
+- Keep it snappy and enthusiastic, avoiding technical jargon
+- If unsure, offer a quick tip and invite questions"""
+        
+        # Build conversation context
+        conversation_context = system_prompt + "\n\n"
+        
+        # Add recent conversation history (last 10 messages)
+        recent_history = conversation_sessions[session_key][-10:]
+        for msg in recent_history:
+            conversation_context += f"Human: {msg['user']}\nAssistant: {msg['assistant']}\n\n"
+        
+        # Add current message with length instruction
+        length_instruction = "" if wants_detailed else "Keep response under 50 words and direct. "
+        full_prompt = conversation_context + f"Human: {message}\nAssistant: {length_instruction}"
+        
+        # Generate response
+        response = model.generate_content(full_prompt)
+        
+        if response.text:
+            bot_message = response.text.strip()
+            
+            # Sanitize links to ensure they are HTML <a> tags
+            bot_message = sanitize_links(bot_message, products)
+            
+            # Store in conversation history
+            conversation_sessions[session_key].append({
+                'user': message,
+                'assistant': bot_message,
+                'timestamp': time.time()
+            })
+            
+            # Keep only last 20 exchanges to manage memory
+            if len(conversation_sessions[session_key]) > 20:
+                conversation_sessions[session_key] = conversation_sessions[session_key][-20:]
+            
+            return {
+                'message': bot_message,
+                'type': 'text/html'
+            }
+        else:
+            return {
+                'message': "I'm having trouble processing that right now. Could you try asking in a different way?",
+                'type': 'text'
+            }
+    
+    except Exception as e:
+        print(f"Error calling Gemini API: {str(e)}")
+        return {
+            'message': "I'm experiencing some technical difficulties. Please try again in a moment!",
+            'type': 'text'
+        }
+
+@app.route('/chat', methods=['POST'])
+def chat():
+    """
+    Main chat endpoint for handling user messages
+    """
+    try:
+        # Get data from frontend
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({'error': 'No data provided'}), 400
+        
+        user_message = data.get('message', '')
+        user_id = data.get('user_id', 'anonymous')
+        session_id = data.get('session_id', 'default')
+        
+        if not user_message:
+            return jsonify({'error': 'No message provided'}), 400
+        
+        # Get response from Gemini
+        response = get_gemini_response(user_message, user_id, session_id)
+        
+        # Log the interaction
+        print(f"User {user_id} (Session: {session_id}): {user_message}")
+        print(f"Gemini Response: {response['message'][:100]}...")
+        
+        return jsonify(response)
+    
+    except Exception as e:
+        print(f"Error processing chat: {str(e)}")
+        return jsonify({
+            'message': "I'm sorry, I'm having trouble right now. Please try again!",
+            'type': 'text'
+        }), 500
+
+@app.route('/clear-session', methods=['POST'])
+def clear_session():
+    """
+    Clear conversation history for a session
+    """
+    try:
+        data = request.get_json()
+        user_id = data.get('user_id', 'anonymous')
+        session_id = data.get('session_id', 'default')
+        
+        session_key = f"{user_id}_{session_id}"
+        
+        if session_key in conversation_sessions:
+            del conversation_sessions[session_key]
+        
+        return jsonify({
+            'message': 'Session cleared successfully',
+            'status': 'success'
+        })
+    
+    except Exception as e:
+        print(f"Error clearing session: {str(e)}")
+        return jsonify({'error': 'Failed to clear session'}), 500
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """
+    Health check endpoint
+    """
+    gemini_status = "connected" if model else "disconnected"
+    
+    return jsonify({
+        'status': 'healthy',
+        'message': 'Pink Matter Chatbot API is running!',
+        'gemini_status': gemini_status,
+        'active_sessions': len(conversation_sessions),
+        'timestamp': time.time()
+    })
+
+@app.route('/sessions', methods=['GET'])
+def get_active_sessions():
+    """
+    Get info about active sessions (for debugging)
+    """
+    try:
+        session_info = {}
+        for session_key, messages in conversation_sessions.items():
+            session_info[session_key] = {
+                'message_count': len(messages),
+                'last_activity': messages[-1]['timestamp'] if messages else None
+            }
+        
+        return jsonify({
+            'total_sessions': len(conversation_sessions),
+            'sessions': session_info
+        })
+    
+    except Exception as e:
+        print(f"Error getting sessions: {str(e)}")
+        return jsonify({'error': 'Failed to get session info'}), 500
+
+# Error handlers
+@app.errorhandler(404)
+def not_found(error):
+    return jsonify({'error': 'Endpoint not found'}), 404
+
+@app.errorhandler(500)
+def internal_error(error):
+    return jsonify({'error': 'Internal server error'}), 500
+
+if __name__ == '__main__':
+    print("🚀 Starting Pink Matter Chatbot API with Gemini...")
+    print("🤖 Gemini API Status:", "✅ Connected" if model else "❌ Not Connected")
+    print("💬 Chat endpoint: http://localhost:5000/chat")
+    print("🧹 Clear session: http://localhost:5000/clear-session")
+    print("📊 Sessions info: http://localhost:5000/sessions")
+    print("❤️  Health check: http://localhost:5000/health")
+    print("\n🔑 Make sure to add your GEMINI_API_KEY to the .env file!")
+    app.run(debug=True)
